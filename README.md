@@ -67,51 +67,9 @@ ams upgrade my-session
 | 5 | 重复被拒 | `DuplicateMemoryError` |
 | 6 | 版本不兼容 | `VersionMismatchError` |
 
-## 并发锁超时复现
+## 并发和脏文件复现
 
-测试时可通过修改 `LOCK_TIMEOUT_SECONDS` 常量缩短超时时间：
-
-```python
-# pytest fixture 示例（已在 conftest.py 中实现）
-@pytest.fixture
-def short_lock_timeout():
-    import agent_memory_session.constants as const
-    original = const.LOCK_TIMEOUT_SECONDS
-    const.LOCK_TIMEOUT_SECONDS = 0.5  # 改小好测
-    yield 0.5
-    const.LOCK_TIMEOUT_SECONDS = original
-```
-
-手动复现：
-1. 进程 A 持有锁（用 `fcntl.flock` 独占锁定 `.lock` 文件）
-2. 进程 B 尝试 save/load，等锁
-3. 超时后进程 B 抛出 `LockTimeoutError`
-
-## 脏文件复现
-
-两种场景都会触发 `CorruptedSessionError`：
-
-**场景1：半截 tmp 文件**
-- 写入过程中进程被杀（SIGKILL/SIGTERM）
-- `.tmp` 文件残留，`.json` 文件未创建或仍是旧版
-- load 时优先检测 `.tmp`，直接抛错
-
-**场景2：明显脏数据**
-- JSON 文件为空
-- JSON 格式无效（解析失败）
-- 缺少必要字段（`session_id`, `warm_memories`, `cold_memories`）
-
-手动复现半截写入：
-```bash
-# 1. 找到会话对应的哈希文件名
-python -c "from agent_memory_session.persistence import SessionPersistence; print(SessionPersistence._safe_filename('test-session'))"
-
-# 2. 创建不完整的 .tmp 文件
-echo '{"session_id": "test-session", "warm_memories": [' > /path/to/persist/{hash}.tmp
-
-# 3. 尝试加载，会触发 CorruptedSessionError
-ams get test-session
-```
+并发锁超时：一进程持锁时另一进程等锁超时抛 `LockTimeoutError`，测试可改 `LOCK_TIMEOUT_SECONDS` 常量缩短等待时间；脏文件：写入时先写 `.tmp` 临时文件，若进程被杀留半截 `.tmp` 或 JSON 无效/缺字段，load 时直接走 `CorruptedSessionError` 不会拼半个 Session。
 
 ## 测试
 

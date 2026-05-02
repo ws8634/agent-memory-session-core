@@ -117,15 +117,22 @@ def cmd_add(args, persist: SessionPersistence) -> int:
     memory = SessionMemory(
         session_id=session_id,
         max_warm_memories=args.max_warm,
+        persist_dir=args.persist_dir,
     )
 
     if persist.exists(session_id):
-        try:
-            session = persist.load(session_id)
-            memory.load_from_session(session)
-        except VersionMismatchError:
-            session = persist.load_legacy(session_id)
-            memory.load_from_session(session)
+        if args.force:
+            try:
+                session = persist.load(session_id, check_version=False)
+                memory.load_from_session(session)
+            except Exception:
+                pass
+        else:
+            try:
+                session = persist.load(session_id)
+                memory.load_from_session(session)
+            except VersionMismatchError:
+                raise
 
     memory.add_message(role=args.role, content=args.content)
     persist.save(memory.session, force_overwrite=args.force)
@@ -137,10 +144,7 @@ def cmd_get(args, persist: SessionPersistence) -> int:
     session_id = args.session_id
     check_version = not args.no_version_check
 
-    try:
-        session = persist.load(session_id, check_version=check_version)
-    except VersionMismatchError:
-        session = persist.load_legacy(session_id)
+    session = persist.load(session_id, check_version=check_version)
 
     if args.type == "warm":
         memories = [m.to_dict() for m in session.warm_memories]

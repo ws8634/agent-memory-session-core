@@ -3,16 +3,17 @@ import time
 import json
 import hashlib
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import fcntl
 
-from .models import Session
+from .models import Session, Message
 from .exceptions import (
     LockTimeoutError,
     ConcurrentPersistError,
     CorruptedSessionError,
     IOError,
     VersionMismatchError,
+    DuplicateMemoryError,
 )
 from .constants import (
     LOCK_TIMEOUT_SECONDS,
@@ -22,6 +23,10 @@ from .constants import (
     SESSION_VERSION,
     ERROR_PREFIX,
     ERROR_SUFFIX,
+    GLOBAL_COLD_MEMORY_FILENAME,
+    COLD_MEMORY_DEDUP_MODE,
+    COLD_MEMORY_DEDUP_MODE_REJECT,
+    COLD_MEMORY_DEDUP_MODE_OVERWRITE,
 )
 
 
@@ -259,3 +264,140 @@ class SessionPersistence:
     def upgrade_session(self, session_id: str) -> bool:
         session = self.load_legacy(session_id)
         return self.save(session, force_overwrite=True)
+
+
+class GlobalColdMemoryStore:
+    def __init__(
+        self,
+        persist_dir: str,
+        dedup_mode: str = COLD_MEMORY_DEDUP_MODE,
+        lock_timeout: float = LOCK_TIMEOUT_SECONDS,
+    ):
+        self.persist_dir = os.path.abspath(persist_dir)
+        self.dedup_mode = dedup_mode
+        self.lock_timeout = lock_timeout
+        self._memories: List[Message] = []
+        self._loaded = False
+        os.makedirs(self.persist_dir, exist_ok=True)
+
+    def _storage_path(self) -> str:
+        return os.path.join(self.persist_dir, f"{GLOBAL_COLD_MEMORY_FILENAME}.json")
+
+    def _lock_path(self) -> str:
+        return os.path.join(self.persist_dir, f"{GLOBAL_COLD_MEMORY_FILENAME}{LOCK_FILE_SUFFIX}")
+
+    def _tmp_path(self) -> str:
+        return os.path.join(self.persist_dir, f"{GLOBAL_COLD_MEMORY_FILENAME}{TMP_FILE_SUFFIX}")
+
+    def _load_if_needed(self):
+        if self._loaded:
+            return
+
+        storage_path = self._storage_path()
+        if not os.path.exists(storage_path):
+            self._memories = []
+            self._loaded = True
+            return
+
+        try:
+            with open(storage_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            raise IOError(f"Failed to read global cold memory: {str(e)}") from e
+
+        if not content.strip():
+            self._memories = []
+            self._loaded = True
+            return
+
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise CorruptedSessionError(f"Invalid JSON in global cold memory: {str(e)}") from e
+
+        if not isinstance(data, list):
+            raise CorruptedSessionError("Global cold memory must be a list")
+
+        self._memories = [Message.from_dict(m) for m in data]
+        self._loaded = True
+
+    def _save(self):
+        storage_path = self._storage_path()
+        tmp_path = self._tmp_path()
+
+        data = [m.to_dict() for m in self._memories]
+        json_content = json.dumps(data, indent=2, ensure_ascii=False)
+
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(json_content)
+                f.flush()
+                os.fsync(f.fileno())
+
+            if os.path.exists(storage_path):
+                old_path = storage_path + ".old"
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+                os.rename(storage_path, old_path)
+
+            os.rename(tmp_path, storage_path)
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            raise IOError(f"Failed to save global cold memory: {str(e)}") from e
+
+    def _find_duplicate(self, message: Message) -> Optional[int]:
+        for idx, msg in enumerate(self._memories):
+            if msg.role == message.role and msg.content == message.content:
+                return idx
+        return None
+
+    def add(self, message: Message) -> bool:
+        with SessionLock(self._lock_path(), timeout=self.lock_timeout):
+            self._load_if_needed()
+
+            existing_idx = self._find_duplicate(message)
+
+            if existing_idx is not None:
+                if self.dedup_mode == COLD_MEMORY_DEDUP_MODE_REJECT:
+                    detail = f"role={message.role}, content={repr(message.content)[:50]}..."
+                    raise DuplicateMemoryError(detail)
+                elif self.dedup_mode == COLD_MEMORY_DEDUP_MODE_OVERWRITE:
+                    self._memories[existing_idx] = message
+                    self._save()
+                    return True
+
+            self._memories.append(message)
+            self._save()
+            return True
+
+    def get_all(self) -> List[Message]:
+        with SessionLock(self._lock_path(), timeout=self.lock_timeout):
+            self._load_if_needed()
+            return list(self._memories)
+
+    def count(self) -> int:
+        with SessionLock(self._lock_path(), timeout=self.lock_timeout):
+            self._load_if_needed()
+            return len(self._memories)
+
+    def check_duplicate(self, role: str, content: str) -> bool:
+        with SessionLock(self._lock_path(), timeout=self.lock_timeout):
+            self._load_if_needed()
+            for msg in self._memories:
+                if msg.role == role and msg.content == content:
+                    return True
+            return False
+
+    def clear(self):
+        with SessionLock(self._lock_path(), timeout=self.lock_timeout):
+            self._memories = []
+            self._save()
+            self._loaded = True
+
+    def force_reload(self):
+        self._loaded = False
+        self._load_if_needed()

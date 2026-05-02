@@ -14,6 +14,7 @@ from agent_memory_session import (
     Message,
     SessionPersistence,
     SessionLock,
+    GlobalColdMemoryStore,
     LockTimeoutError,
     ConcurrentPersistError,
     CorruptedSessionError,
@@ -23,34 +24,48 @@ from agent_memory_session import (
     LOCK_TIMEOUT_SECONDS,
     ERROR_PREFIX,
     ERROR_SUFFIX,
+    EXIT_CODE_SUCCESS,
     EXIT_CODE_LOCK_TIMEOUT,
     EXIT_CODE_CORRUPTED,
     EXIT_CODE_CONCURRENT,
     EXIT_CODE_DUPLICATE,
     EXIT_CODE_VERSION,
+    EXIT_CODE_ERROR,
     SESSION_VERSION,
     MAX_WARM_MEMORIES,
     TMP_FILE_SUFFIX,
+    GLOBAL_COLD_MEMORY_FILENAME,
+    COLD_MEMORY_DEDUP_MODE_REJECT,
+    COLD_MEMORY_DEDUP_MODE_OVERWRITE,
 )
 
 
 class TestBasicMemory:
-    def test_create_session_memory(self):
-        mem = SessionMemory("test-session")
+    def test_create_session_memory(self, temp_persist_dir):
+        cold_store = GlobalColdMemoryStore(temp_persist_dir)
+        cold_store.clear()
+
+        mem = SessionMemory("test-session", persist_dir=temp_persist_dir, global_cold_store=cold_store)
         assert mem.session_id == "test-session"
         assert len(mem.get_warm_memories()) == 0
         assert len(mem.get_cold_memories()) == 0
 
-    def test_add_warm_memory(self):
-        mem = SessionMemory("test-session", max_warm_memories=5)
+    def test_add_warm_memory(self, temp_persist_dir):
+        cold_store = GlobalColdMemoryStore(temp_persist_dir)
+        cold_store.clear()
+
+        mem = SessionMemory("test-session", max_warm_memories=5, persist_dir=temp_persist_dir, global_cold_store=cold_store)
         msg = mem.add_message("user", "Hello")
         assert msg.role == "user"
         assert msg.content == "Hello"
         assert len(mem.get_warm_memories()) == 1
         assert len(mem.get_cold_memories()) == 0
 
-    def test_overflow_to_cold_memory(self):
-        mem = SessionMemory("test-session", max_warm_memories=3)
+    def test_overflow_to_cold_memory(self, temp_persist_dir):
+        cold_store = GlobalColdMemoryStore(temp_persist_dir)
+        cold_store.clear()
+
+        mem = SessionMemory("test-session", max_warm_memories=3, persist_dir=temp_persist_dir, global_cold_store=cold_store)
 
         for i in range(5):
             mem.add_message("user", f"Message {i}")
@@ -63,14 +78,141 @@ class TestBasicMemory:
         assert "Message 1" in cold_contents
 
 
-class TestColdMemoryDeduplication:
-    def test_cold_memory_dedup_reject_mode(self):
+class TestGlobalColdMemorySharing:
+    def test_two_sessions_share_cold_memory_reject_mode(self, temp_persist_dir):
         from agent_memory_session.constants import COLD_MEMORY_DEDUP_MODE_REJECT
+
+        cold_store = GlobalColdMemoryStore(
+            temp_persist_dir,
+            dedup_mode=COLD_MEMORY_DEDUP_MODE_REJECT,
+        )
+        cold_store.clear()
+
+        mem1 = SessionMemory(
+            "session-1",
+            max_warm_memories=1,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store,
+        )
+
+        mem1.add_message("user", "SharedContent")
+        mem1.add_message("assistant", "Response 1")
+
+        assert cold_store.count() == 1
+        cold_contents = [m.content for m in cold_store.get_all()]
+        assert "SharedContent" in cold_contents
+
+        mem2 = SessionMemory(
+            "session-2",
+            max_warm_memories=1,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store,
+        )
+
+        mem2.add_message("user", "SharedContent")
+
+        with pytest.raises(DuplicateMemoryError) as exc_info:
+            mem2.add_message("assistant", "Response 2")
+
+        assert ERROR_PREFIX in str(exc_info.value)
+        assert ERROR_SUFFIX in str(exc_info.value)
+        assert "冷记忆重复条目被拒绝" in str(exc_info.value)
+        assert exc_info.value.exit_code == EXIT_CODE_DUPLICATE
+
+        assert cold_store.count() == 1
+
+    def test_two_sessions_share_cold_memory_overwrite_mode(self, temp_persist_dir):
+        cold_store = GlobalColdMemoryStore(
+            temp_persist_dir,
+            dedup_mode=COLD_MEMORY_DEDUP_MODE_OVERWRITE,
+        )
+        cold_store.clear()
+
+        mem1 = SessionMemory(
+            "session-1",
+            max_warm_memories=1,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store,
+        )
+
+        mem1.add_message("user", "SharedContent")
+        mem1.add_message("assistant", "Response 1")
+
+        assert cold_store.count() == 1
+        first_cold_msg = cold_store.get_all()[0]
+        assert first_cold_msg.role == "user"
+        assert first_cold_msg.content == "SharedContent"
+
+        mem2 = SessionMemory(
+            "session-2",
+            max_warm_memories=1,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store,
+        )
+
+        mem2.add_message("user", "SharedContent")
+        mem2.add_message("assistant", "Response 2")
+
+        assert cold_store.count() == 1
+
+        cold_contents = [m.content for m in cold_store.get_all()]
+        assert "SharedContent" in cold_contents
+
+        mem3 = SessionMemory(
+            "session-3",
+            max_warm_memories=1,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store,
+        )
+        mem3.add_message("user", "NewContent")
+        original_count = cold_store.count()
+
+        mem3.add_message("assistant", "Response 3")
+
+        assert cold_store.count() == original_count + 1
+        cold_contents_final = [m.content for m in cold_store.get_all()]
+        assert "NewContent" in cold_contents_final
+        assert "SharedContent" in cold_contents_final
+
+    def test_cold_memory_persists_to_disk(self, temp_persist_dir):
+        cold_store1 = GlobalColdMemoryStore(temp_persist_dir)
+        cold_store1.clear()
+
+        mem1 = SessionMemory(
+            "session-a",
+            max_warm_memories=1,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store1,
+        )
+        mem1.add_message("user", "PersistedContent")
+        mem1.add_message("assistant", "Response")
+
+        assert cold_store1.count() == 1
+
+        cold_store2 = GlobalColdMemoryStore(temp_persist_dir)
+        cold_store2.force_reload()
+
+        assert cold_store2.count() == 1
+        cold_contents = [m.content for m in cold_store2.get_all()]
+        assert "PersistedContent" in cold_contents
+
+        global_cold_path = os.path.join(temp_persist_dir, f"{GLOBAL_COLD_MEMORY_FILENAME}.json")
+        assert os.path.exists(global_cold_path)
+
+
+class TestColdMemoryDeduplication:
+    def test_cold_memory_dedup_reject_mode(self, temp_persist_dir):
+        cold_store = GlobalColdMemoryStore(
+            temp_persist_dir,
+            dedup_mode=COLD_MEMORY_DEDUP_MODE_REJECT,
+        )
+        cold_store.clear()
 
         mem = SessionMemory(
             "test-session",
             max_warm_memories=2,
-            cold_dedup_mode=COLD_MEMORY_DEDUP_MODE_REJECT,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store,
         )
 
         mem.add_message("user", "DupContent")
@@ -87,13 +229,18 @@ class TestColdMemoryDeduplication:
         assert "冷记忆重复条目被拒绝" in str(exc_info.value)
         assert exc_info.value.exit_code == EXIT_CODE_DUPLICATE
 
-    def test_cold_memory_dedup_overwrite_mode(self):
-        from agent_memory_session.constants import COLD_MEMORY_DEDUP_MODE_OVERWRITE
+    def test_cold_memory_dedup_overwrite_mode(self, temp_persist_dir):
+        cold_store = GlobalColdMemoryStore(
+            temp_persist_dir,
+            dedup_mode=COLD_MEMORY_DEDUP_MODE_OVERWRITE,
+        )
+        cold_store.clear()
 
         mem = SessionMemory(
             "test-session",
             max_warm_memories=1,
-            cold_dedup_mode=COLD_MEMORY_DEDUP_MODE_OVERWRITE,
+            persist_dir=temp_persist_dir,
+            global_cold_store=cold_store,
         )
 
         mem.add_message("user", "Same content")
@@ -102,27 +249,6 @@ class TestColdMemoryDeduplication:
         mem.add_message("user", "Same content")
 
         assert len(mem.get_cold_memories()) == 2
-
-    def test_cross_session_cold_memory_independent(self, temp_persist_dir):
-        persist = SessionPersistence(temp_persist_dir)
-
-        mem1 = SessionMemory("session-1", max_warm_memories=1)
-        mem1.add_message("user", "Shared content")
-        mem1.add_message("assistant", "Response 1")
-        persist.save(mem1.session)
-
-        mem2 = SessionMemory("session-2", max_warm_memories=1)
-        mem2.add_message("user", "Shared content")
-        mem2.add_message("assistant", "Response 2")
-        persist.save(mem2.session)
-
-        s1 = persist.load("session-1")
-        s2 = persist.load("session-2")
-
-        assert len(s1.cold_memories) == 1
-        assert len(s2.cold_memories) == 1
-        assert s1.cold_memories[0].content == "Shared content"
-        assert s2.cold_memories[0].content == "Shared content"
 
 
 class TestLockTimeout:
@@ -340,6 +466,99 @@ print("OK")
             text=True,
         )
         assert result.returncode == 0, result.stderr
+
+
+class TestCLISubprocess:
+    def test_cli_lock_timeout_exit_code_and_stderr(self, temp_persist_dir, short_lock_timeout):
+        import fcntl
+
+        persist = SessionPersistence(temp_persist_dir)
+        session = Session(session_id="cli-lock-test")
+        persist.save(session)
+
+        lock_path = persist._lock_path("cli-lock-test")
+        held_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(held_fd, fcntl.LOCK_EX)
+
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "agent_memory_session.cli",
+                "--persist-dir", temp_persist_dir,
+                "--lock-timeout", "0.5",
+                "get", "cli-lock-test",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        fcntl.flock(held_fd, fcntl.LOCK_UN)
+        os.close(held_fd)
+
+        assert result.returncode == EXIT_CODE_LOCK_TIMEOUT
+        assert ERROR_PREFIX in result.stderr
+        assert ERROR_SUFFIX in result.stderr
+        assert "获取会话锁超时" in result.stderr
+
+    def test_cli_corrupted_exit_code_and_stderr(self, temp_persist_dir):
+        persist = SessionPersistence(temp_persist_dir)
+        session = Session(session_id="cli-corrupt-test")
+        persist.save(session)
+
+        tmp_path = persist._tmp_path("cli-corrupt-test")
+        with open(tmp_path, "w") as f:
+            f.write("{bad")
+
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "agent_memory_session.cli",
+                "--persist-dir", temp_persist_dir,
+                "get", "cli-corrupt-test",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == EXIT_CODE_CORRUPTED
+        assert ERROR_PREFIX in result.stderr
+        assert ERROR_SUFFIX in result.stderr
+        assert "会话数据损坏或不完整" in result.stderr
+
+    def test_cli_version_mismatch_exit_code_and_stderr(self, temp_persist_dir):
+        persist = SessionPersistence(temp_persist_dir)
+        session = Session(session_id="cli-version-test")
+        session.version = "0.5"
+        persist.save(session, force_overwrite=True)
+
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "agent_memory_session.cli",
+                "--persist-dir", temp_persist_dir,
+                "get", "cli-version-test",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == EXIT_CODE_VERSION
+        assert ERROR_PREFIX in result.stderr
+        assert ERROR_SUFFIX in result.stderr
+        assert "会话版本不兼容" in result.stderr
+
+    def test_cli_success_exit_code(self, temp_persist_dir):
+        cold_store = GlobalColdMemoryStore(temp_persist_dir)
+        cold_store.clear()
+
+        result_add = subprocess.run(
+            [
+                sys.executable, "-m", "agent_memory_session.cli",
+                "--persist-dir", temp_persist_dir,
+                "add", "cli-success-test", "user", "hello",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result_add.returncode == EXIT_CODE_SUCCESS
 
 
 class TestSubprocessKillMidWrite:

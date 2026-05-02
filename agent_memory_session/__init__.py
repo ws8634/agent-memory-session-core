@@ -1,6 +1,6 @@
 from .memory import SessionMemory
 from .models import Message, Session
-from .persistence import SessionPersistence, SessionLock
+from .persistence import SessionPersistence, SessionLock, GlobalColdMemoryStore
 from .exceptions import (
     AgentMemoryError,
     LockTimeoutError,
@@ -29,6 +29,8 @@ from .constants import (
     MAX_WARM_MEMORIES,
     COLD_MEMORY_DEDUP_MODE_REJECT,
     COLD_MEMORY_DEDUP_MODE_OVERWRITE,
+    COLD_MEMORY_DEDUP_MODE,
+    GLOBAL_COLD_MEMORY_FILENAME,
 )
 
 __all__ = [
@@ -37,6 +39,7 @@ __all__ = [
     "Session",
     "SessionPersistence",
     "SessionLock",
+    "GlobalColdMemoryStore",
     "AgentMemoryError",
     "LockTimeoutError",
     "ConcurrentPersistError",
@@ -62,4 +65,6 @@ __all__ = [
     "MAX_WARM_MEMORIES",
     "COLD_MEMORY_DEDUP_MODE_REJECT",
     "COLD_MEMORY_DEDUP_MODE_OVERWRITE",
+    "COLD_MEMORY_DEDUP_MODE",
+    "GLOBAL_COLD_MEMORY_FILENAME",
 ]

@@ -8,6 +8,8 @@ PERSIST_DIR = os.path.expanduser("~/.agent_memory_sessions")
 TMP_FILE_SUFFIX = ".tmp"
 LOCK_FILE_SUFFIX = ".lock"
 
+GLOBAL_COLD_MEMORY_FILENAME = "_global_cold_memories"
+
 ERROR_PREFIX = "[AgentMemory] "
 ERROR_SUFFIX = " - 操作失败，请检查配置或重试"
 
